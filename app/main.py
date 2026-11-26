@@ -76,12 +76,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="FD/EMFILE Sampling Gateway Drill API",
-    version="1.0.0",
+    version="2.0.0",
     description=(
-        "Controls a low-RLIMIT_NOFILE TCP echo process. Fill its descriptor "
+        "Controls a low-RLIMIT_NOFILE TCP echo process multiplexed by a single "
+        "network I/O thread (at most 4 threads total). Fill its descriptor "
         "table with retained sample logs to force real accept(2) EMFILE errors, "
-        "verify old connections still echo, probe EOF/RST behavior, inspect "
-        "the actual EMFILE counter, then release descriptors for recovery."
+        "verify dozens of old connections still echo and that a stalled reader "
+        "only backpressures itself, probe EOF/RST behavior, inspect the actual "
+        "EMFILE counter, then release descriptors for recovery."
     ),
     lifespan=lifespan,
 )
@@ -243,7 +245,7 @@ def accept_loop_check(
     request: Request,
     seconds: float = Query(default=1.0, ge=0.1, le=5.0),
 ) -> dict[str, Any]:
-    """Sample accept-thread CPU to demonstrate that EMFILE handling does not spin."""
+    """Sample the I/O thread CPU to demonstrate that EMFILE handling does not spin."""
     controller = controller_or_503(request)
     try:
         sample = controller.accept_loop_sample(seconds)

@@ -213,10 +213,12 @@ class EchoController:
         return self.start()
 
     def accept_loop_sample(self, seconds: float = 1.0) -> dict[str, Any]:
-        """Sample CPU/state of the worker's accept thread from procfs."""
+        """Sample CPU/state of the worker's network I/O thread from procfs."""
         if not self.is_alive() or not self.ready:
             raise EchoControllerError("echo worker is not running")
         pid = int(self.ready["pid"])
+        # The worker reports the single multiplexing I/O thread under the
+        # legacy accept_thread_tid name for backwards compatibility.
         tid = int(self.ready["accept_thread_tid"])
         before = _read_thread_stat(pid, tid)
         time.sleep(max(0.0, float(seconds)))

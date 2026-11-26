@@ -3,9 +3,21 @@
 
 The process intentionally lowers RLIMIT_NOFILE, keeps one reserved descriptor,
 and opens sample log files until its descriptor table is full.  A full table
-makes a real accept(2) call fail with EMFILE.  The accept thread then uses its
-reserved descriptor to accept and immediately close the one probe connection,
-giving the client EOF/RST promptly without a polling busy loop.
+makes a real accept(2) call fail with EMFILE.  The network I/O thread then uses
+its reserved descriptor to accept and immediately close the one probe
+connection, giving the client EOF/RST promptly without a polling busy loop.
+
+Concurrency model (drill requirement: at most 4 worker threads):
+
+* exactly one network I/O thread multiplexes the listener and every TCP
+  connection through ``select(2)`` -- no per-connection threads, so dozens of
+  simultaneous sampled connections cost only one thread;
+* the main thread is the blocking JSON control loop on stdin/stdout;
+* every connection owns an ordered send queue.  A connection that stops
+  reading only applies backpressure to itself: ``send(2)`` returns EAGAIN, the
+  unsent bytes stay in that connection's queue in their original order, and
+  every other connection keeps being serviced.  When the slow reader drains
+  its socket again it receives the complete echo in the original order.
 
 The only control channel is line-delimited JSON on stdin/stdout.  All logs go
 to stderr so stdout remains a protocol stream.
@@ -23,12 +35,17 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 
 EMFILE = errno.EMFILE
+
+# Hard contractual upper bound on the number of threads this process may
+# create.  The actual steady-state count is two: control thread + I/O thread.
+MAX_WORKER_THREADS = int(os.getenv("DRILL_MAX_THREADS", "4"))
 
 
 def log(message: str) -> None:
@@ -83,6 +100,8 @@ class Metrics:
     reaped_after_emfile_total: int = 0
     recovery_accept_emfile_total: int = 0
     active_connections: int = 0
+    max_active_connections: int = 0
+    connections_closed_total: int = 0
     echo_bytes_total: int = 0
     echo_chunks_total: int = 0
     last_emfile_at: float | None = None
@@ -100,6 +119,8 @@ class Metrics:
                 "reaped_after_emfile_total": self.reaped_after_emfile_total,
                 "recovery_accept_emfile_total": self.recovery_accept_emfile_total,
                 "active_connections": self.active_connections,
+                "max_active_connections": self.max_active_connections,
+                "connections_closed_total": self.connections_closed_total,
                 "echo_bytes_total": self.echo_bytes_total,
                 "echo_chunks_total": self.echo_chunks_total,
                 "last_emfile_at_unix": self.last_emfile_at,
@@ -114,6 +135,31 @@ class Metrics:
             }
 
 
+@dataclass
+class ConnectionState:
+    """Per-connection state owned exclusively by the network I/O thread."""
+
+    conn: socket.socket
+    addr: tuple[str, int]
+    conn_id: int
+    created_at: float = field(default_factory=time.time)
+    # Ordered queue of chunks waiting to be echoed.  ``send_offset`` is the
+    # number of bytes already written from the head chunk.  Byte order is
+    # therefore preserved exactly, including across EAGAIN backpressure.
+    send_queue: deque[bytes] = field(default_factory=deque)
+    send_offset: int = 0
+    read_closed: bool = False
+    rx_bytes: int = 0
+    tx_bytes: int = 0
+    recv_chunks: int = 0
+    echo_chunks: int = 0
+
+    def queued_bytes(self) -> int:
+        if not self.send_queue:
+            return 0
+        return sum(len(chunk) for chunk in self.send_queue) - self.send_offset
+
+
 class EchoWorker:
     def __init__(
         self,
@@ -121,7 +167,7 @@ class EchoWorker:
         host: str,
         port: int,
         sample_dir: Path,
-        backlog: int = 32,
+        backlog: int = 64,
         sample_content_bytes: int = 512,
     ) -> None:
         self.host = host
@@ -134,11 +180,17 @@ class EchoWorker:
         self.stop_event = threading.Event()
         self.fd_lock = threading.Lock()
         self.tid_ready = threading.Event()
+        # Key name kept for API/procfs compatibility; the single network I/O
+        # thread now performs accept *and* all connection echo I/O.
         self.accept_thread_tid: int | None = None
 
         self.server: socket.socket | None = None
         self.bound_port: int | None = None
         self.rescue_fd: int | None = None
+
+        # fd -> ConnectionState; touched only by the I/O thread outside close().
+        self.connections: dict[int, ConnectionState] = {}
+        self._next_conn_id = 1
 
         self.sample_handles: list[Any] = []
         self.sample_records: list[dict[str, Any]] = []
@@ -166,12 +218,13 @@ class EchoWorker:
         # one slot used to accept and close an EMFILE probe.
         self.rescue_fd = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
 
+        threading.current_thread().name = "fd-drill-control"
         thread = threading.Thread(
-            target=self._accept_loop, name="fd-drill-accept", daemon=True
+            target=self._io_loop, name="fd-drill-network-io", daemon=True
         )
         thread.start()
         if not self.tid_ready.wait(timeout=2.0):
-            raise RuntimeError("accept thread did not report its thread id")
+            raise RuntimeError("network I/O thread did not report its thread id")
 
         return {
             "host": self.host,
@@ -179,6 +232,7 @@ class EchoWorker:
             "listener_fd": server.fileno(),
             "rescue_fd": self.rescue_fd,
             "accept_thread_tid": self.accept_thread_tid,
+            "io_thread_tid": self.accept_thread_tid,
         }
 
     def close(self) -> None:
@@ -187,6 +241,13 @@ class EchoWorker:
             if self.server is not None:
                 self.server.close()
         finally:
+            # The I/O thread observes stop_event and exits its select() loop;
+            # give it a moment, then close any connections still registered.
+            deadline = time.monotonic() + 0.5
+            while self.connections and time.monotonic() < deadline:
+                time.sleep(0.02)
+            for state in list(self.connections.values()):
+                self._close_connection(state)
             self._close_samples()
             if self.rescue_fd is not None:
                 try:
@@ -318,34 +379,182 @@ class EchoWorker:
         )
         return result
 
-    # ---------- TCP echo and accept handling ----------
+    # ---------- single-threaded multiplexed TCP echo ----------
 
-    def _serve_echo(self, conn: socket.socket, addr: tuple[str, int]) -> None:
-        with self.metrics.lock:
-            self.metrics.active_connections += 1
+    def _close_connection(self, state: ConnectionState) -> None:
+        """Remove and close a connection.  Safe from the I/O thread and close()."""
+        self.connections.pop(state.conn.fileno(), None)
         try:
-            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            while not self.stop_event.is_set():
-                try:
-                    chunk = conn.recv(65536)
-                except OSError:
-                    break
-                if not chunk:
-                    break
-                try:
-                    conn.sendall(chunk)
-                except OSError:
-                    break
-                with self.metrics.lock:
-                    self.metrics.echo_bytes_total += len(chunk)
-                    self.metrics.echo_chunks_total += 1
-        finally:
-            with self.metrics.lock:
-                self.metrics.active_connections -= 1
+            state.conn.close()
+        except OSError:
+            pass
+        with self.metrics.lock:
+            self.metrics.active_connections -= 1
+            self.metrics.connections_closed_total += 1
+
+    def _accept_pending(self) -> None:
+        """Drain the listener backlog; handle a real EMFILE exactly as before."""
+        assert self.server is not None
+        server = self.server
+        while not self.stop_event.is_set():
             try:
-                conn.close()
+                conn, addr = server.accept()
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    return
+                if exc.errno == EMFILE:
+                    with self.metrics.lock:
+                        self.metrics.emfile_total += 1
+                        self.metrics.last_emfile_at = time.time()
+                        self.metrics.last_emfile_errno = exc.errno
+                    self._recover_from_emfile()
+                    # Always return to select(); see _recover_from_emfile and
+                    # the comment in the previous threaded implementation:
+                    # retrying accept() immediately on a full table can spin.
+                    return
+                if self.stop_event.is_set():
+                    return
+                with self.metrics.lock:
+                    self.metrics.other_accept_errors_total += 1
+                    self.metrics.last_recovery_error = f"accept: {exc}"
+                self.stop_event.wait(0.1)
+                return
+
+            conn.setblocking(False)
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
+            state = ConnectionState(
+                conn=conn,
+                addr=addr,
+                conn_id=self._next_conn_id,
+            )
+            self._next_conn_id += 1
+            self.connections[conn.fileno()] = state
+            with self.metrics.lock:
+                self.metrics.accepted_total += 1
+                self.metrics.active_connections += 1
+                self.metrics.max_active_connections = max(
+                    self.metrics.max_active_connections,
+                    self.metrics.active_connections,
+                )
+
+    def _handle_readable(self, state: ConnectionState) -> None:
+        """Drain everything currently readable into the ordered send queue."""
+        sock = state.conn
+        # Per-wakeup budget: a flooding peer must not starve the other
+        # connections multiplexed by this single I/O thread.  Remaining bytes
+        # stay in the kernel socket buffer and trigger another readable event.
+        budget = 32
+        while budget > 0:
+            try:
+                chunk = sock.recv(65536)
+            except BlockingIOError:
+                # Kernel receive buffer drained; wait for the next wakeup.
+                return
+            except OSError:
+                self._close_connection(state)
+                return
+            if not chunk:
+                # Peer half-closed.  Flush queued echo first, then close.
+                state.read_closed = True
+                if state.queued_bytes() == 0:
+                    self._close_connection(state)
+                return
+            budget -= 1
+            state.rx_bytes += len(chunk)
+            state.recv_chunks += 1
+            # Enqueue the exact bytes; FIFO order guarantees an in-order,
+            # complete echo even if this connection is currently write-blocked.
+            state.send_queue.append(chunk)
+
+    def _handle_writable(self, state: ConnectionState) -> None:
+        """Push as much of the queued echo as the socket currently accepts."""
+        sock = state.conn
+        while state.queued_bytes() > 0:
+            head = state.send_queue[0]
+            view = memoryview(head)[state.send_offset :]
+            try:
+                written = sock.send(view)
+            except BlockingIOError:
+                # Backpressure: leave the queue untouched and try next wakeup.
+                return
+            except OSError:
+                # Reset/peer gone: drop this connection only.
+                self._close_connection(state)
+                return
+            if written <= 0:
+                return
+            state.send_offset += written
+            state.tx_bytes += written
+            if state.send_offset >= len(head):
+                state.send_queue.popleft()
+                state.send_offset = 0
+                state.echo_chunks += 1
+                with self.metrics.lock:
+                    self.metrics.echo_chunks_total += 1
+                    self.metrics.echo_bytes_total += len(head)
+
+        if state.read_closed:
+            # All queued data echoed after the peer's FIN: close gracefully.
+            self._close_connection(state)
+
+    def _io_loop(self) -> None:
+        """One thread multiplexes listener readiness and all connection I/O."""
+        self.accept_thread_tid = threading.get_native_id()
+        self.tid_ready.set()
+        assert self.server is not None
+        server = self.server
+
+        while not self.stop_event.is_set():
+            read_list: list[socket.socket] = [server]
+            write_list: list[socket.socket] = []
+            for state in self.connections.values():
+                if not state.read_closed:
+                    read_list.append(state.conn)
+                if state.queued_bytes() > 0:
+                    write_list.append(state.conn)
+
+            try:
+                # Blocking wait with a short timeout so stop_event is noticed
+                # promptly; with no events the thread sleeps in the kernel and
+                # consumes no CPU (no polling / no busy-wait).
+                readable, writable, errored = select.select(
+                    read_list, write_list, read_list + write_list, 0.25
+                )
+            except OSError as exc:
+                if exc.errno == errno.EINTR:
+                    continue
+                if self.stop_event.is_set():
+                    break
+                with self.metrics.lock:
+                    self.metrics.other_accept_errors_total += 1
+                    self.metrics.last_recovery_error = f"select: {exc}"
+                self.stop_event.wait(0.25)
+                continue
+
+            if server in readable:
+                self._accept_pending()
+
+            for sock in readable:
+                if sock is server:
+                    continue
+                state = self.connections.get(sock.fileno())
+                if state is not None:
+                    self._handle_readable(state)
+
+            for sock in writable:
+                state = self.connections.get(sock.fileno())
+                if state is not None:
+                    self._handle_writable(state)
+
+            for sock in errored:
+                state = self.connections.get(sock.fileno())
+                if state is not None:
+                    self._close_connection(state)
 
     def _recover_from_emfile(self) -> str:
         """Use the reserved slot to reap and close one waiting probe.
@@ -406,73 +615,45 @@ class EchoWorker:
                             self.metrics.last_recovery_error = (
                                 f"could not recreate rescue fd: {exc}"
                             )
+            if outcome == "emfile":
+                # Defensive backoff if the reserved slot could not be restored.
+                self.stop_event.wait(0.05)
         return outcome
 
-    def _accept_loop(self) -> None:
-        self.accept_thread_tid = threading.get_native_id()
-        self.tid_ready.set()
-        assert self.server is not None
+    # ---------- introspection ----------
 
-        while not self.stop_event.is_set():
-            try:
-                readable, _, _ = select.select([self.server], [], [], 0.25)
-            except OSError as exc:
-                if exc.errno == errno.EINTR:
-                    continue
-                if self.stop_event.is_set():
-                    break
-                with self.metrics.lock:
-                    self.metrics.other_accept_errors_total += 1
-                    self.metrics.last_recovery_error = f"select: {exc}"
-                # An unexpected persistent error must not busy-spin.
-                self.stop_event.wait(0.25)
-                continue
+    def _thread_info(self) -> tuple[int, list[dict[str, Any]]]:
+        # threading.enumerate() needs no descriptor, so thread accounting keeps
+        # working even when the FD table is completely full (unlike /proc).
+        threads = [
+            {"tid": thread.native_id, "name": thread.name}
+            for thread in threading.enumerate()
+            if thread.native_id is not None
+        ]
+        return len(threads), threads
 
-            if not readable:
-                continue
-
-            while True:
-                try:
-                    conn, addr = self.server.accept()
-                except OSError as exc:
-                    if exc.errno == errno.EINTR:
-                        continue
-                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
-                        break
-                    if exc.errno == EMFILE:
-                        with self.metrics.lock:
-                            self.metrics.emfile_total += 1
-                            self.metrics.last_emfile_at = time.time()
-                            self.metrics.last_emfile_errno = exc.errno
-                        recovery = self._recover_from_emfile()
-                        # Return to select() instead of immediately calling
-                        # accept() again.  With the table full, Linux can return
-                        # EMFILE before discovering that the queue is empty; an
-                        # immediate retry would therefore spin.  select() sleeps
-                        # until another connection is actually pending.
-                        if recovery == "emfile":
-                            # Defensive backoff if the reserved slot could not
-                            # be restored; the normal path does not wait here.
-                            self.stop_event.wait(0.05)
-                        break
-
-                    if self.stop_event.is_set():
-                        break
-                    with self.metrics.lock:
-                        self.metrics.other_accept_errors_total += 1
-                        self.metrics.last_recovery_error = f"accept: {exc}"
-                    self.stop_event.wait(0.1)
-                    break
-
-                with self.metrics.lock:
-                    self.metrics.accepted_total += 1
-                thread = threading.Thread(
-                    target=self._serve_echo,
-                    args=(conn, addr),
-                    name=f"echo-{addr[0]}:{addr[1]}",
-                    daemon=True,
-                )
-                thread.start()
+    def _connection_summary(self) -> dict[str, Any]:
+        states = list(self.connections.values())
+        queued = [state.queued_bytes() for state in states]
+        details = [
+            {
+                "conn_id": state.conn_id,
+                "fd": state.conn.fileno(),
+                "peer": f"{state.addr[0]}:{state.addr[1]}",
+                "rx_bytes": state.rx_bytes,
+                "tx_bytes": state.tx_bytes,
+                "queued_bytes": state.queued_bytes(),
+                "read_closed": state.read_closed,
+                "age_seconds": round(time.time() - state.created_at, 3),
+            }
+            for state in sorted(states, key=lambda item: item.conn_id)[:30]
+        ]
+        return {
+            "active": len(states),
+            "send_queue_bytes_total": sum(queued),
+            "send_queue_max_bytes": max(queued, default=0),
+            "details": details,
+        }
 
     # ---------- control plane ----------
 
@@ -484,6 +665,7 @@ class EchoWorker:
             records = list(self.sample_records[-20:])
             fill_error = self.fill_error
             rescue_fd = self.rescue_fd
+        thread_count, threads = self._thread_info()
         return {
             "ok": True,
             "type": "status",
@@ -502,6 +684,12 @@ class EchoWorker:
             },
             "rescue_fd": rescue_fd,
             "accept_thread_tid": self.accept_thread_tid,
+            "io_thread_tid": self.accept_thread_tid,
+            "thread_count": thread_count,
+            "thread_limit": MAX_WORKER_THREADS,
+            "within_thread_limit": thread_count <= MAX_WORKER_THREADS,
+            "threads": threads,
+            "connections": self._connection_summary(),
             "sample_dir": str(self.sample_dir),
             "open_sample_files": sample_count,
             "sample_files_tail": records,
@@ -532,7 +720,7 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=Path(os.getenv("DRILL_SAMPLE_DIR", "/tmp/fd-emfile-drill-samples")),
     )
-    parser.add_argument("--backlog", type=int, default=32)
+    parser.add_argument("--backlog", type=int, default=64)
     args = parser.parse_args(argv)
 
     rlimit_info = lower_nofile_limit(args.nofile_limit)
